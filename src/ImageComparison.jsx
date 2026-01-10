@@ -10,6 +10,13 @@ import {
   deleteDoc,
 } from "firebase/firestore";
 import {
+  signInWithPopup,
+  GoogleAuthProvider,
+  signInAnonymously,
+  onAuthStateChanged,
+  signOut as firebaseSignOut,
+} from "firebase/auth";
+import {
   Upload,
   ZoomIn,
   ZoomOut,
@@ -22,9 +29,11 @@ import {
   ThumbsUp,
   ThumbsDown,
   User,
+  LogOut,
+  LogIn,
 } from "lucide-react";
 
-import { db } from "./firebase";
+import { db, auth } from "./firebase";
 
 // ✅ Define the current version (single source of truth)
 const CURRENT_VERSION = "4.1";
@@ -104,6 +113,27 @@ const scoreCandidate = (c) => {
   const srcPriority =
     src === "images" ? 30 : src === "uvpaintHistoryImages" ? 10 : 0;
   return (hasActive ? 100 : 0) + (isActive ? 40 : 0) + srcPriority;
+};
+
+// -----------------------------
+// Trend Indicator Helper
+// -----------------------------
+const getTrendIndicator = (difference, threshold = 0.5) => {
+  if (Math.abs(difference) < threshold) return { 
+    indicator: "→", 
+    status: "stable",
+    direction: "neutral"
+  };
+  if (difference > 0) return { 
+    indicator: "↑", 
+    status: "increasing",
+    direction: "up"
+  };
+  return { 
+    indicator: "↓", 
+    status: "decreasing",
+    direction: "down"
+  };
 };
 
 // -----------------------------
@@ -268,6 +298,9 @@ const computeAggregatedMetrics = (processedInspections) => {
         ? 100
         : 0;
 
+    // Calculate trend indicator
+    const trend = getTrendIndicator(actionsDifference);
+
     const label = insp.vehicle
       ? `${insp.vehicle.year || ""} ${insp.vehicle.make || ""} ${
           insp.vehicle.model || ""
@@ -286,6 +319,10 @@ const computeAggregatedMetrics = (processedInspections) => {
       avgLatestActions,
       actionsDifference,
       actionsPercentChange,
+      // Trend indicators
+      trend: trend.indicator,
+      trendStatus: trend.status,
+      trendDirection: trend.direction,
     });
 
     publishedUvpaint.forEach((img) => {
@@ -331,6 +368,9 @@ const computeAggregatedMetrics = (processedInspections) => {
         ? 100
         : 0;
 
+    // Calculate trend indicator
+    const trend = getTrendIndicator(actionsDifference);
+
     return {
       ...r,
       avgActionsPerImage,
@@ -338,6 +378,10 @@ const computeAggregatedMetrics = (processedInspections) => {
       avgLatestActions,
       actionsDifference,
       actionsPercentChange,
+      // Trend indicators
+      trend: trend.indicator,
+      trendStatus: trend.status,
+      trendDirection: trend.direction,
     };
   });
 
@@ -706,7 +750,7 @@ function SlimOverviewGridTab({
               </div>
 
               <div
-                className="rounded-lg overflow-hidden mb-2"
+                className="rounded-lg overflow-hidden mb-2 comparisonImageBox"
                 style={{
                   height: "200px",
                   width: "100%",
@@ -718,12 +762,14 @@ function SlimOverviewGridTab({
                   alignItems: "center",
                   justifyContent: "center",
                   position: "relative",
+                  cursor: "zoom-in",
                 }}
               >
                 {item.imageUrl ? (
                   <img
                     src={item.imageUrl}
                     alt={item.label}
+                    className="comparisonImg"
                     style={{
                       maxWidth: "100%",
                       maxHeight: "100%",
@@ -882,7 +928,7 @@ function ZoomerGridTab({ currentInspection, zoom, themeVars, theme, cardStyle })
               </div>
 
               <div
-                className="rounded-lg overflow-hidden mb-2"
+                className="rounded-lg overflow-hidden mb-2 comparisonImageBox"
                 style={{
                   height: "200px",
                   width: "100%",
@@ -894,12 +940,14 @@ function ZoomerGridTab({ currentInspection, zoom, themeVars, theme, cardStyle })
                   alignItems: "center",
                   justifyContent: "center",
                   position: "relative",
+                  cursor: "zoom-in",
                 }}
               >
                 {item.imageUrl ? (
                   <img
                     src={item.imageUrl}
                     alt={item.label}
+                    className="comparisonImg"
                     style={{
                       maxWidth: "100%",
                       maxHeight: "100%",
@@ -980,7 +1028,81 @@ function MetricsTab({
   validation,
   votes,
   allComparisons,
+  inspections,
+  themeVars,
+  theme,
 }) {
+  // Per-image vote metrics aggregated by image type/camera (like Table D)
+  const voteMetricsByType = useMemo(() => {
+    if (!allComparisons || !votes) return [];
+    
+    // Group comparisons by image type/camera/side/cameraId (same key as Table D)
+    const grouped = new Map();
+    
+    allComparisons.forEach((comp) => {
+      const compId = comp.id;
+      const voteData = votes[compId];
+      if (!voteData || voteData.total === 0) return;
+      
+      const metadata = comp.metadata;
+      const pov = metadata?.pov;
+      if (!pov) return;
+      
+      // Create same key as Table D uses
+      const key = [
+        metadata?.bucketType || "N/A",
+        pov.simulatedCamera || "N/A",
+        pov.simulatedCameraSide || "N/A",
+        pov.originalCameraId || "N/A",
+      ].join("|");
+      
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          imageType: metadata?.bucketType || "N/A",
+          simulatedCamera: pov.simulatedCamera || "N/A",
+          simulatedCameraSide: pov.simulatedCameraSide || "N/A",
+          originalCameraId: pov.originalCameraId || "N/A",
+          totalApprovals: 0,
+          totalRejections: 0,
+          totalVotes: 0,
+          totalActions: 0,
+          comparisonCount: 0,
+        });
+      }
+      
+      const group = grouped.get(key);
+      group.totalApprovals += voteData.approvals;
+      group.totalRejections += voteData.rejections;
+      group.totalVotes += voteData.total;
+      
+      // Get actions for this comparison (latest version)
+      const actions = comp.metadata?.actions?.[1] ?? "N/A";
+      const actionsNum = typeof actions === "number" ? actions : (typeof actions === "string" && actions !== "N/A" ? Number(actions) || 0 : 0);
+      group.totalActions += actionsNum;
+      group.comparisonCount += 1;
+    });
+    
+    // Convert to array and calculate percentages
+    return Array.from(grouped.values())
+      .map((group) => {
+        const approvalPercentage = group.totalVotes > 0
+          ? (group.totalApprovals / group.totalVotes) * 100
+          : 0;
+        const avgActions = group.comparisonCount > 0
+          ? group.totalActions / group.comparisonCount
+          : 0;
+        
+        return {
+          ...group,
+          approvalPercentage,
+          avgActions,
+        };
+      })
+      .filter((g) => g.totalVotes > 0) // Only show groups with votes
+      .sort((a, b) => b.approvalPercentage - a.approvalPercentage);
+  }, [allComparisons, votes]);
+
+  // Keep original voteMetrics for overall stats
   const voteMetrics = useMemo(() => {
     if (!allComparisons) return [];
     return allComparisons
@@ -992,7 +1114,11 @@ function MetricsTab({
           total: 0,
           percentage: 0,
         };
-        if (!voteData || voteData.total === 0) return null;
+        
+        // Get actions for this comparison (latest version)
+        const actions = comp.metadata?.actions?.[1] ?? "N/A";
+        const actionsNum = typeof actions === "number" ? actions : (typeof actions === "string" && actions !== "N/A" ? Number(actions) || 0 : 0);
+        
         return {
           comparisonId: compId,
           name: comp.name,
@@ -1001,11 +1127,205 @@ function MetricsTab({
           rejections: voteData.rejections,
           total: voteData.total,
           percentage: Number(voteData.percentage || 0),
+          actions: actionsNum,
         };
       })
-      .filter(Boolean)
+      .filter((m) => m.total > 0) // Only show comparisons with votes
       .sort((a, b) => b.percentage - a.percentage);
   }, [allComparisons, votes]);
+
+  // Per-inspection aggregated scores
+  const inspectionScores = useMemo(() => {
+    if (!inspections || !votes) return [];
+    
+    return inspections.map((insp) => {
+      const inspectionComparisons = allComparisons?.filter(
+        (comp) => comp.metadata?.inspectionId === insp.inspectionId
+      ) || [];
+      
+      const scores = inspectionComparisons
+        .map((comp) => {
+          const compId = comp.id;
+          const voteData = votes[compId];
+          if (!voteData || voteData.total === 0) return null;
+          return voteData.percentage;
+        })
+        .filter((s) => s !== null);
+      
+      const avgScore = scores.length > 0
+        ? scores.reduce((sum, s) => sum + s, 0) / scores.length
+        : 0;
+      
+      const totalVotes = inspectionComparisons.reduce((sum, comp) => {
+        const voteData = votes[comp.id];
+        return sum + (voteData?.total || 0);
+      }, 0);
+      
+      const imagesWithVotes = scores.length;
+      const totalImages = inspectionComparisons.length;
+      
+      return {
+        inspectionId: insp.inspectionId,
+        label: insp.vehicle
+          ? `${insp.vehicle.year || ""} ${insp.vehicle.make || ""} ${insp.vehicle.model || ""}`.trim()
+          : `Inspection ${inspections.indexOf(insp) + 1}`,
+        averageScore: avgScore,
+        totalVotes,
+        imagesWithVotes,
+        totalImages,
+        coverage: totalImages > 0 ? (imagesWithVotes / totalImages) * 100 : 0,
+      };
+    })
+    .filter((insp) => insp.totalVotes > 0) // Only show inspections with votes
+    .sort((a, b) => b.averageScore - a.averageScore);
+  }, [inspections, allComparisons, votes]);
+
+  // Overall dashboard stats
+  const overallStats = useMemo(() => {
+    if (!voteMetrics.length) {
+      return {
+        totalComparisons: 0,
+        totalVotes: 0,
+        overallApprovalRate: 0,
+        totalApprovals: 0,
+        totalRejections: 0,
+        totalActions: 0,
+        averageActionsPerImage: 0,
+      };
+    }
+    
+    const totalComparisons = voteMetrics.length;
+    const totalVotes = voteMetrics.reduce((sum, m) => sum + m.total, 0);
+    const totalApprovals = voteMetrics.reduce((sum, m) => sum + m.approvals, 0);
+    const totalRejections = voteMetrics.reduce((sum, m) => sum + m.rejections, 0);
+    const totalActions = voteMetrics.reduce((sum, m) => sum + m.actions, 0);
+    
+    const overallApprovalRate = totalVotes > 0
+      ? (totalApprovals / totalVotes) * 100
+      : 0;
+    
+    const averageActionsPerImage = totalComparisons > 0
+      ? totalActions / totalComparisons
+      : 0;
+    
+    return {
+      totalComparisons,
+      totalVotes,
+      overallApprovalRate,
+      totalApprovals,
+      totalRejections,
+      totalActions,
+      averageActionsPerImage,
+    };
+  }, [voteMetrics]);
+
+  // Export functions
+  const exportToCSV = () => {
+    const headers = [
+      "Image Type",
+      "Camera",
+      "Side",
+      "Camera ID",
+      "Approvals",
+      "Rejections",
+      "Total Votes",
+      "Approval %",
+      "Avg Actions",
+    ];
+    
+    const rows = voteMetricsByType.map((m) => [
+      m.imageType,
+      m.simulatedCamera,
+      m.simulatedCameraSide,
+      m.originalCameraId,
+      m.totalApprovals,
+      m.totalRejections,
+      m.totalVotes,
+      m.approvalPercentage.toFixed(2),
+      m.avgActions.toFixed(2),
+    ]);
+    
+    const csvContent = [
+      headers.join(","),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
+    ].join("\n");
+    
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `image-comparison-votes-${currentVersion}-${new Date().toISOString().split("T")[0]}.csv`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const exportInspectionScores = () => {
+    const headers = [
+      "Inspection ID",
+      "Label",
+      "Average Score %",
+      "Total Votes",
+      "Images With Votes",
+      "Total Images",
+      "Coverage %",
+    ];
+    
+    const rows = inspectionScores.map((insp) => [
+      insp.inspectionId,
+      insp.label,
+      insp.averageScore.toFixed(2),
+      insp.totalVotes,
+      insp.imagesWithVotes,
+      insp.totalImages,
+      insp.coverage.toFixed(2),
+    ]);
+    
+    const csvContent = [
+      headers.join(","),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
+    ].join("\n");
+    
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `inspection-scores-${currentVersion}-${new Date().toISOString().split("T")[0]}.csv`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const exportToJSON = () => {
+    const data = {
+      version: currentVersion,
+      exportDate: new Date().toISOString(),
+      overallStats,
+      perImageScores: voteMetricsByType,
+      perInspectionScores: inspectionScores,
+    };
+    
+    const jsonContent = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonContent], { type: "application/json" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `image-comparison-data-${currentVersion}-${new Date().toISOString().split("T")[0]}.json`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const themeVarsLocal = themeVars || {
+    text: "#ffffff",
+    subText: "#94a3b8",
+    headerText: "#ffffff",
+    panelBorder: "rgba(148,163,184,0.25)",
+  };
+  const themeLocal = theme || "dark";
 
   return (
     <div className="space-y-8">
@@ -1023,18 +1343,202 @@ function MetricsTab({
         </div>
       </div>
 
-      {voteMetrics.length > 0 && (
+      {/* Overall Dashboard Stats */}
+      <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-white font-semibold">
+            📊 Overall Dashboard — Multi-User Aggregated Scores
+          </h2>
+          <div className="flex gap-2">
+            <button
+              onClick={exportToCSV}
+              className="px-4 py-2 rounded-lg text-sm"
+              style={{
+                background: themeLocal === "dark" ? "#2563eb" : "#1d4ed8",
+                color: "#fff",
+              }}
+            >
+              Export Images CSV
+            </button>
+            <button
+              onClick={exportInspectionScores}
+              className="px-4 py-2 rounded-lg text-sm"
+              style={{
+                background: themeLocal === "dark" ? "#2563eb" : "#1d4ed8",
+                color: "#fff",
+              }}
+            >
+              Export Inspections CSV
+            </button>
+            <button
+              onClick={exportToJSON}
+              className="px-4 py-2 rounded-lg text-sm"
+              style={{
+                background: themeLocal === "dark" ? "#2563eb" : "#1d4ed8",
+                color: "#fff",
+              }}
+            >
+              Export All JSON
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Total Comparisons</div>
+            <div className="text-white text-2xl font-bold">
+              {overallStats.totalComparisons}
+            </div>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Total Votes</div>
+            <div className="text-white text-2xl font-bold">
+              {overallStats.totalVotes}
+            </div>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Overall Approval Rate</div>
+            <div className="text-white text-2xl font-bold">
+              {overallStats.overallApprovalRate.toFixed(1)}%
+            </div>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Avg Actions/Image</div>
+            <div className="text-white text-2xl font-bold">
+              {overallStats.averageActionsPerImage.toFixed(2)}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4">
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Total Approvals</div>
+            <div className="text-green-400 text-xl font-bold">
+              {overallStats.totalApprovals}
+            </div>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Total Rejections</div>
+            <div className="text-red-400 text-xl font-bold">
+              {overallStats.totalRejections}
+            </div>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-4">
+            <div className="text-slate-400 text-sm mb-1">Total Actions</div>
+            <div className="text-white text-xl font-bold">
+              {overallStats.totalActions}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Per-Inspection Scores */}
+      {inspectionScores.length > 0 && (
         <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
           <h2 className="text-white font-semibold mb-3">
-            📊 Image Approval Ratings (Latest)
+            📊 Per-Inspection Aggregated Scores
           </h2>
+          <div className="text-slate-300 text-sm mb-3">
+            Average approval percentage across all images in each inspection
+          </div>
 
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm border-collapse">
               <thead className="text-slate-300">
                 <tr>
                   <th className="text-left py-2 pr-4 border border-slate-600">
-                    Comparison
+                    Inspection
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Score %
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Total Votes
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Images w/ Votes
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Total Images
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Coverage %
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-200">
+                {inspectionScores.map((insp) => (
+                  <tr
+                    key={insp.inspectionId}
+                    className="hover:bg-slate-800/40"
+                  >
+                    <td className="py-2 pr-4 border border-slate-600">
+                      <button
+                        className="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+                        onClick={() => onJumpToInspection?.(insp.inspectionId)}
+                        title={insp.inspectionId}
+                      >
+                        {insp.label}
+                      </button>
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      <span
+                        className={`font-semibold ${
+                          insp.averageScore >= 70
+                            ? "text-green-400"
+                            : insp.averageScore >= 50
+                            ? "text-yellow-400"
+                            : "text-red-400"
+                        }`}
+                      >
+                        {insp.averageScore.toFixed(1)}%
+                      </span>
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {insp.totalVotes}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {insp.imagesWithVotes}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {insp.totalImages}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {insp.coverage.toFixed(1)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Per-Image Scores (with Actions) - Aggregated by Image Type */}
+      {voteMetricsByType.length > 0 && (
+        <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
+          <h2 className="text-white font-semibold mb-3">
+            📊 Per-Image Scores (Approval % + Actions) — Aggregated by Image Type
+          </h2>
+          <div className="text-slate-300 text-sm mb-3">
+            Aggregated approval scores and actions by image type/camera across all inspections
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm border-collapse">
+              <thead className="text-slate-300">
+                <tr>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Image Type
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Camera
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Side
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Camera ID
                   </th>
                   <th className="text-left py-2 pr-4 border border-slate-600">
                     Approvals
@@ -1048,44 +1552,53 @@ function MetricsTab({
                   <th className="text-left py-2 pr-4 border border-slate-600">
                     Approval %
                   </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Actions
+                  </th>
                 </tr>
               </thead>
               <tbody className="text-slate-200">
-                {voteMetrics.map((metric) => (
+                {voteMetricsByType.map((metric, idx) => (
                   <tr
-                    key={metric.comparisonId}
+                    key={`${metric.imageType}-${metric.simulatedCamera}-${metric.simulatedCameraSide}-${idx}`}
                     className="hover:bg-slate-800/40"
                   >
                     <td className="py-2 pr-4 border border-slate-600">
-                      <button
-                        className="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
-                        onClick={() => onJumpToInspection?.(metric.inspectionId)}
-                        title={metric.comparisonId}
-                      >
-                        {metric.name}
-                      </button>
-                    </td>
-                    <td className="py-2 pr-4 border border-slate-600 text-green-400">
-                      {metric.approvals}
-                    </td>
-                    <td className="py-2 pr-4 border border-slate-600 text-red-400">
-                      {metric.rejections}
+                      {metric.imageType}
                     </td>
                     <td className="py-2 pr-4 border border-slate-600">
-                      {metric.total}
+                      {metric.simulatedCamera}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {metric.simulatedCameraSide}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {metric.originalCameraId}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600 text-green-400">
+                      {metric.totalApprovals}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600 text-red-400">
+                      {metric.totalRejections}
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {metric.totalVotes}
                     </td>
                     <td className="py-2 pr-4 border border-slate-600">
                       <span
                         className={`font-semibold ${
-                          metric.percentage >= 70
+                          metric.approvalPercentage >= 70
                             ? "text-green-400"
-                            : metric.percentage >= 50
+                            : metric.approvalPercentage >= 50
                             ? "text-yellow-400"
                             : "text-red-400"
                         }`}
                       >
-                        {metric.percentage.toFixed(1)}%
+                        {metric.approvalPercentage.toFixed(1)}%
                       </span>
+                    </td>
+                    <td className="py-2 pr-4 border border-slate-600">
+                      {metric.avgActions.toFixed(2)}
                     </td>
                   </tr>
                 ))}
@@ -1095,7 +1608,259 @@ function MetricsTab({
         </div>
       )}
 
-      {/* validation + tables are unchanged from your paste */}
+      {/* Table A - Inspection Health with Trends */}
+      {tableA && tableA.length > 0 && (
+        <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
+          <h2 className="text-white font-semibold mb-3">
+            📊 Table A — Inspection Health (Old vs New)
+          </h2>
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm border-collapse">
+              <thead className="text-slate-300">
+                <tr>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Inspection
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Published Images
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Images w/ Actions
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Actions (Old)
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Actions (New)
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Difference
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    % Change
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Trend
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-200">
+                {tableA.map((r) => {
+                  const hasMoreActions = r.avgLatestActions > r.avgPreviousActions;
+                  const hasFewerActions = r.avgLatestActions < r.avgPreviousActions;
+                  const rowBg = hasMoreActions
+                    ? themeLocal === "dark"
+                      ? "rgba(239,68,68,0.15)"
+                      : "rgba(239,68,68,0.08)"
+                    : hasFewerActions
+                    ? themeLocal === "dark"
+                      ? "rgba(34,197,94,0.15)"
+                      : "rgba(34,197,94,0.08)"
+                    : "transparent";
+
+                  return (
+                    <tr
+                      key={r.inspectionId}
+                      className="hover:bg-slate-800/40"
+                      style={{ background: rowBg }}
+                    >
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <button
+                          className="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+                          onClick={() => onJumpToInspection?.(r.inspectionId)}
+                          title={r.inspectionId}
+                        >
+                          {r.label || `Inspection ${r.inspectionIndex}`}
+                        </button>
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.publishedCount}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.imagesWithActions}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.avgPreviousActions.toFixed(2)}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.avgLatestActions.toFixed(2)}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className={
+                            r.actionsDifference > 0
+                              ? "text-red-400"
+                              : r.actionsDifference < 0
+                              ? "text-green-400"
+                              : ""
+                          }
+                        >
+                          {r.actionsDifference > 0 ? "+" : ""}
+                          {r.actionsDifference.toFixed(2)}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className={
+                            r.actionsPercentChange > 0
+                              ? "text-red-400"
+                              : r.actionsPercentChange < 0
+                              ? "text-green-400"
+                              : ""
+                          }
+                        >
+                          {r.actionsPercentChange > 0 ? "+" : ""}
+                          {r.actionsPercentChange.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className="text-lg"
+                          title={r.trendStatus}
+                        >
+                          {r.trend || "→"}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Table D - Detailed Breakdown by Image Type/Camera with Trends */}
+      {tableD && tableD.length > 0 && (
+        <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
+          <h2 className="text-white font-semibold mb-3">
+            📊 Table D — Detailed Breakdown by Image Type/Camera (Old vs New)
+          </h2>
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm border-collapse">
+              <thead className="text-slate-300">
+                <tr>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Image Type
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Camera
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Side
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Camera ID
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Images
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Actions (Old)
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Avg Actions (New)
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Difference
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    % Change
+                  </th>
+                  <th className="text-left py-2 pr-4 border border-slate-600">
+                    Trend
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-200">
+                {tableD.map((r, idx) => {
+                  const hasMoreActions = r.avgLatestActions > r.avgPreviousActions;
+                  const hasFewerActions = r.avgLatestActions < r.avgPreviousActions;
+                  const rowBg = hasMoreActions
+                    ? themeLocal === "dark"
+                      ? "rgba(239,68,68,0.15)"
+                      : "rgba(239,68,68,0.08)"
+                    : hasFewerActions
+                    ? themeLocal === "dark"
+                      ? "rgba(34,197,94,0.15)"
+                      : "rgba(34,197,94,0.08)"
+                    : "transparent";
+
+                  return (
+                    <tr
+                      key={`${r.imageType}-${r.simulatedCamera}-${r.simulatedCameraSide}-${idx}`}
+                      className="hover:bg-slate-800/40"
+                      style={{ background: rowBg }}
+                    >
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.imageType}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.simulatedCamera}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.simulatedCameraSide}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.originalCameraId}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.images}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.avgPreviousActions.toFixed(2)}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        {r.avgLatestActions.toFixed(2)}
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className={
+                            r.actionsDifference > 0
+                              ? "text-red-400"
+                              : r.actionsDifference < 0
+                              ? "text-green-400"
+                              : ""
+                          }
+                        >
+                          {r.actionsDifference > 0 ? "+" : ""}
+                          {r.actionsDifference.toFixed(2)}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className={
+                            r.actionsPercentChange > 0
+                              ? "text-red-400"
+                              : r.actionsPercentChange < 0
+                              ? "text-green-400"
+                              : ""
+                          }
+                        >
+                          {r.actionsPercentChange > 0 ? "+" : ""}
+                          {r.actionsPercentChange.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 border border-slate-600">
+                        <span
+                          className="text-lg"
+                          title={r.trendStatus}
+                        >
+                          {r.trend || "→"}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* validation + tables */}
       {validation && (
         <div className="bg-slate-800/30 border border-slate-600 rounded-lg p-4">
           <h2 className="text-white font-semibold mb-3">
@@ -1216,9 +1981,6 @@ function MetricsTab({
           </div>
         </div>
       )}
-
-      {/* your inspection health + heatmap tables continue here... */}
-      {/* Keep as in your paste — no behavior changes needed. */}
     </div>
   );
 }
@@ -1241,41 +2003,82 @@ export default function ImageComparison() {
 
   const [theme, setTheme] = useState("dark");
 
-  // ✅ Auditor name
-  const [userName, setUserName] = useState("");
+  // ✅ Firebase Authentication state
+  const [user, setUser] = useState(null);
+  const [isAuthenticating, setIsAuthenticating] = useState(true);
 
   // ✅ Voting state
   const [votes, setVotes] = useState({}); // aggregated from Firestore
   const [userVotes, setUserVotes] = useState({}); // local per-user "already voted" state
 
-  // Load stored auditor name + local votes
+  // Listen for authentication state changes
   useEffect(() => {
-    try {
-      const storedName = localStorage.getItem("auditorName");
-      if (storedName) setUserName(storedName);
-    } catch {}
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      setIsAuthenticating(false);
+      
+      // Load user votes when user changes
+      if (firebaseUser) {
+        try {
+          const storedUser = localStorage.getItem(`userVotes_${firebaseUser.uid}`);
+          if (storedUser) setUserVotes(JSON.parse(storedUser));
+        } catch (e) {
+          console.error("Failed to load local user votes", e);
+        }
+      } else {
+        setUserVotes({});
+      }
+    });
 
-    try {
-      const storedUser = localStorage.getItem("userVotes");
-      if (storedUser) setUserVotes(JSON.parse(storedUser));
-    } catch (e) {
-      console.error("Failed to load local user votes", e);
-    }
+    return () => unsubscribe();
   }, []);
 
-  // Persist auditor name
-  useEffect(() => {
+  // Authentication functions
+  const signInWithGoogle = async () => {
+    const provider = new GoogleAuthProvider();
     try {
-      localStorage.setItem("auditorName", userName);
-    } catch {}
-  }, [userName]);
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      console.error("Google sign-in error:", error);
+      let errorMsg = error.message;
+      if (error.code === 'auth/operation-not-allowed') {
+        errorMsg = 'Google Sign-In is not enabled. Please enable it in Firebase Console > Authentication > Sign-in method > Google.';
+      }
+      alert(`Sign-in failed: ${errorMsg}`);
+    }
+  };
 
-  // Persist local userVotes map
-  useEffect(() => {
+  const handleSignInAnonymously = async () => {
     try {
-      localStorage.setItem("userVotes", JSON.stringify(userVotes));
-    } catch {}
-  }, [userVotes]);
+      await signInAnonymously(auth);
+    } catch (error) {
+      console.error("Anonymous sign-in error:", error);
+      let errorMsg = error.message;
+      if (error.code === 'auth/admin-restricted-operation' || error.code === 'auth/operation-not-allowed') {
+        errorMsg = 'Anonymous Sign-In is not enabled. Please enable it in Firebase Console > Authentication > Sign-in method > Anonymous.';
+      }
+      alert(`Anonymous sign-in failed: ${errorMsg}`);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await firebaseSignOut(auth);
+      setUserVotes({});
+    } catch (error) {
+      console.error("Sign-out error:", error);
+      alert(`Sign-out failed: ${error.message}`);
+    }
+  };
+
+  // Persist local userVotes map (per user)
+  useEffect(() => {
+    if (user) {
+      try {
+        localStorage.setItem(`userVotes_${user.uid}`, JSON.stringify(userVotes));
+      } catch {}
+    }
+  }, [userVotes, user]);
 
   // 🔥 Real-time vote aggregation listener (by version)
   useEffect(() => {
@@ -1309,15 +2112,15 @@ export default function ImageComparison() {
     return () => unsubscribe();
   }, []);
 
-  // ✅ Vote handlers (writes are per image+version+username)
+  // ✅ Vote handlers (writes are per image+version+userId)
   const handleVote = async (comparisonId, voteType) => {
     if (!comparisonId) return;
-    if (!userName.trim()) {
-      alert("Please enter your name as Auditor first!");
+    if (!user) {
+      alert("Please sign in first to vote!");
       return;
     }
 
-    const voteDocId = `${comparisonId}_${currentVersion}_${userName.trim()}`;
+    const voteDocId = `${comparisonId}_${currentVersion}_${user.uid}`;
 
     try {
       await setDoc(
@@ -1325,7 +2128,8 @@ export default function ImageComparison() {
         {
           comparisonId,
           version: currentVersion,
-          userName: userName.trim(),
+          userId: user.uid,
+          userName: user.displayName || user.email || "Anonymous",
           voteType,
           timestamp: serverTimestamp(),
         },
@@ -1342,9 +2146,9 @@ export default function ImageComparison() {
 
   const handleUnvote = async (comparisonId) => {
     if (!comparisonId) return;
-    if (!userName.trim()) return;
+    if (!user) return;
 
-    const voteDocId = `${comparisonId}_${currentVersion}_${userName.trim()}`;
+    const voteDocId = `${comparisonId}_${currentVersion}_${user.uid}`;
 
     try {
       await deleteDoc(doc(db, "votes", voteDocId));
@@ -1904,6 +2708,12 @@ export default function ImageComparison() {
     display: flex;
     align-items: center;
     justify-content: center;
+    position: relative;
+    cursor: zoom-in;
+  }
+  .comparisonImageBox:hover .comparisonImg {
+    transform: scale(1.5) !important;
+    transition: transform 0.3s ease;
   }
   .comparisonImg {
     max-width: 100%;
@@ -1913,6 +2723,7 @@ export default function ImageComparison() {
     will-change: transform;
     user-select: none;
     -webkit-user-drag: none;
+    transition: transform 0.3s ease;
   }
   .comparisonEmpty {
     height: 100%;
@@ -1925,6 +2736,17 @@ export default function ImageComparison() {
   .comparisonEmptyText { font-size: 14px; }
   .comparisonStatus { margin-top: 10px; font-size: 12px; opacity: 0.9; }
   .imgFailed { opacity: 0.35; filter: grayscale(1); }
+
+  /* Hover zoom for grid images */
+  .slimGridItem .comparisonImageBox,
+  .zoomerGridItem .comparisonImageBox {
+    cursor: zoom-in;
+  }
+  .slimGridItem:hover .comparisonImageBox .comparisonImg,
+  .zoomerGridItem:hover .comparisonImageBox .comparisonImg {
+    transform: scale(1.3) !important;
+    transition: transform 0.3s ease;
+  }
 
   .voteBtn {
     display: inline-flex;
@@ -2057,17 +2879,50 @@ export default function ImageComparison() {
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            {/* Auditor name input */}
-            <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={panelStyle}>
-              <User className="w-4 h-4" style={{ color: themeVars.text }} />
-              <input
-                value={userName}
-                onChange={(e) => setUserName(e.target.value)}
-                placeholder="Auditor name"
-                className="bg-transparent outline-none text-sm"
-                style={{ color: themeVars.text }}
-              />
-            </div>
+            {/* Authentication UI */}
+            {isAuthenticating ? (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={panelStyle}>
+                <RefreshCw className="w-4 h-4 animate-spin" style={{ color: themeVars.text }} />
+                <span className="text-sm" style={{ color: themeVars.text }}>Loading...</span>
+              </div>
+            ) : !user ? (
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={signInWithGoogle}
+                  className="px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                  style={{
+                    background: theme === "dark" ? "#2563eb" : "#1d4ed8",
+                    color: "#fff",
+                  }}
+                >
+                  <LogIn className="w-4 h-4" />
+                  Sign in with Google
+                </button>
+                <button
+                  onClick={handleSignInAnonymously}
+                  className="px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                  style={panelStyle}
+                >
+                  <User className="w-4 h-4" style={{ color: themeVars.text }} />
+                  <span style={{ color: themeVars.text }}>Sign in Anonymously</span>
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={panelStyle}>
+                <User className="w-4 h-4" style={{ color: themeVars.text }} />
+                <span className="text-sm" style={{ color: themeVars.text }}>
+                  {user.displayName || user.email || "Anonymous"}
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  className="ml-2 p-1 rounded hover:opacity-80 transition-opacity"
+                  title="Sign out"
+                  style={{ color: themeVars.text }}
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            )}
 
             <button
               onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
@@ -2155,6 +3010,9 @@ export default function ImageComparison() {
             validation={metrics.validation}
             votes={votes}
             allComparisons={allComparisons}
+            inspections={inspections}
+            themeVars={themeVars}
+            theme={theme}
             onJumpToInspection={(inspectionId) => {
               const idx = inspections.findIndex((i) => i.inspectionId === inspectionId);
               if (idx >= 0) {

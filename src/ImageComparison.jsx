@@ -6,6 +6,7 @@ import {
   where,
   doc,
   setDoc,
+  getDoc,
   serverTimestamp,
   deleteDoc,
 } from "firebase/firestore";
@@ -38,6 +39,15 @@ import { db, auth } from "./firebase";
 // ✅ Define the current version (single source of truth)
 const CURRENT_VERSION = "4.1";
 const currentVersion = CURRENT_VERSION;
+
+// ✅ Admin email (only this user can upload inspection data)
+const ADMIN_EMAIL = "aaron.g@uveye.com";
+
+// Check if current user is admin
+const isAdmin = (user) => {
+  if (!user) return false;
+  return user.email === ADMIN_EMAIL || user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+};
 
 const API_CONFIG = {
   url:
@@ -1992,6 +2002,8 @@ export default function ImageComparison() {
   const [zoom, setZoom] = useState(100);
   const [loadMethod, setLoadMethod] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [loadingFromFirebase, setLoadingFromFirebase] = useState(false);
+  const [inspectionsLoaded, setInspectionsLoaded] = useState(false);
   const [error, setError] = useState("");
 
   const [activeView, setActiveView] = useState("comparisons");
@@ -2032,6 +2044,44 @@ export default function ImageComparison() {
 
     return () => unsubscribe();
   }, []);
+
+  // Load inspections from Firebase for regular users (not admin) - with real-time updates
+  useEffect(() => {
+    if (!user || isAdmin(user)) return; // Admin doesn't load from Firebase, they upload
+    
+    setLoadingFromFirebase(true);
+    
+    // Use real-time listener so users see data immediately when admin uploads
+    const docRef = doc(db, "campaigns", currentVersion);
+    
+    const unsubscribe = onSnapshot(
+      docRef,
+      (docSnap) => {
+        setLoadingFromFirebase(false);
+        
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (data.inspections && data.inspections.length > 0) {
+            setInspections(data.inspections);
+            setMetrics(data.metrics || { tableA: [], tableD: [], validation: null });
+            setLoadMethod("firebase");
+            setInspectionsLoaded(true);
+          } else {
+            setInspectionsLoaded(false);
+          }
+        } else {
+          setInspectionsLoaded(false);
+        }
+      },
+      (error) => {
+        console.error("Failed to load inspections from Firebase:", error);
+        setLoadingFromFirebase(false);
+        setInspectionsLoaded(false);
+      }
+    );
+    
+    return () => unsubscribe();
+  }, [user, currentVersion]);
 
   // Authentication functions
   const signInWithGoogle = async () => {
@@ -2483,6 +2533,12 @@ export default function ImageComparison() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Check if user is admin
+    if (!user || !isAdmin(user)) {
+      alert("Only admins can upload inspection data.");
+      return;
+    }
+
     setLoading(true);
     setError("");
 
@@ -2542,6 +2598,25 @@ export default function ImageComparison() {
       setCurrentComparisonIndex(0);
       setActiveView("comparisons");
       setLoadMethod("csv");
+
+      // ✅ Save to Firebase for other users
+      try {
+        await setDoc(
+          doc(db, "campaigns", currentVersion),
+          {
+            inspections: processedInspections,
+            metrics: { ...aggregated, validation },
+            uploadedBy: user.email,
+            uploadedAt: serverTimestamp(),
+            version: currentVersion,
+          },
+          { merge: true }
+        );
+        console.log("✅ Inspections saved to Firebase for other users");
+      } catch (firebaseError) {
+        console.error("Failed to save to Firebase:", firebaseError);
+        // Don't block the admin, just log the error
+      }
     } catch (err) {
       setError(err?.message || String(err));
     } finally {
@@ -2764,99 +2839,186 @@ export default function ImageComparison() {
 `;
 
   // -------------------------
-  // Upload screen
+  // Upload screen (Admin only) or Auth screen (Regular users)
   // -------------------------
   if (!loadMethod) {
-    return (
-      <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
-        <style>{comparisonCss}</style>
-
-        <div className="max-w-3xl w-full">
-          <div className="flex items-center justify-between mb-6">
-            <div>
-              <h1 className="text-4xl font-bold" style={{ color: themeVars.headerText }}>
+    // If not authenticated, show auth screen
+    if (!user && !isAuthenticating) {
+      return (
+        <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
+          <style>{comparisonCss}</style>
+          <div className="max-w-md w-full">
+            <div className="rounded-xl p-8" style={panelStyle}>
+              <h1 className="text-3xl font-bold mb-4" style={{ color: themeVars.headerText }}>
                 Image Comparison Platform
               </h1>
-              <p style={{ color: themeVars.subText }}>
-                Only SlimOverview + Zoomer* (grouped by Camera+Side, ignoring serial). UV360 ignored.
+              <p className="mb-6" style={{ color: themeVars.subText }}>
+                Please sign in to view and vote on image comparisons.
               </p>
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={signInWithGoogle}
+                  className="px-6 py-3 rounded-lg flex items-center justify-center gap-2 text-sm font-medium transition-colors"
+                  style={{
+                    background: theme === "dark" ? "#2563eb" : "#1d4ed8",
+                    color: "#fff",
+                  }}
+                >
+                  <LogIn className="w-5 h-5" />
+                  Sign in with Google
+                </button>
+                <button
+                  onClick={handleSignInAnonymously}
+                  className="px-6 py-3 rounded-lg flex items-center justify-center gap-2 text-sm font-medium transition-colors"
+                  style={panelStyle}
+                >
+                  <User className="w-5 h-5" style={{ color: themeVars.text }} />
+                  <span style={{ color: themeVars.text }}>Sign in Anonymously</span>
+                </button>
+              </div>
             </div>
-
-            <button
-              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-              className="px-3 py-2 rounded-lg flex items-center gap-2"
-              style={panelStyle}
-              title="Toggle theme"
-            >
-              {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-              <span style={{ color: themeVars.text }}>{theme === "dark" ? "Light" : "Dark"}</span>
-            </button>
           </div>
+        </div>
+      );
+    }
 
-          <div className="rounded-xl p-8" style={panelStyle}>
-            <div className="flex items-center gap-4 mb-6">
-              <FileText className="w-10 h-10" style={{ color: theme === "dark" ? "#60a5fa" : "#2563eb" }} />
-              <div>
-                <h3 className="text-xl font-semibold" style={{ color: themeVars.text }}>
-                  Upload CSV File
-                </h3>
-                <p className="text-sm mt-1" style={{ color: themeVars.subText }}>
-                  Each row should contain an inspection ID
+    // If authenticated but not admin, show loading/waiting screen
+    if (user && !isAdmin(user)) {
+      if (loadingFromFirebase) {
+        return (
+          <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
+            <style>{comparisonCss}</style>
+            <div className="max-w-md w-full text-center">
+              <RefreshCw className="w-12 h-12 animate-spin mx-auto mb-4" style={{ color: themeVars.text }} />
+              <p style={{ color: themeVars.text }}>Loading inspection data...</p>
+            </div>
+          </div>
+        );
+      }
+
+      if (!inspectionsLoaded) {
+        return (
+          <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
+            <style>{comparisonCss}</style>
+            <div className="max-w-md w-full">
+              <div className="rounded-xl p-8" style={panelStyle}>
+                <h2 className="text-2xl font-bold mb-4" style={{ color: themeVars.headerText }}>
+                  Waiting for Admin
+                </h2>
+                <p style={{ color: themeVars.subText }}>
+                  The admin needs to upload inspection data first. Please check back later.
                 </p>
               </div>
             </div>
+          </div>
+        );
+      }
+    }
 
-            <div className="space-y-4">
-              <div
-                className="text-xs font-mono p-3 rounded"
-                style={{
-                  background: theme === "dark" ? "rgba(15,23,42,0.5)" : "rgba(15,23,42,0.04)",
-                  color: themeVars.subText,
-                }}
-              >
-                <strong>API Endpoint:</strong>
-                <br />
-                {API_CONFIG.url}
+    // Admin upload screen (only shown to admin)
+    if (user && isAdmin(user)) {
+      return (
+        <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
+          <style>{comparisonCss}</style>
+
+          <div className="max-w-3xl w-full">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h1 className="text-4xl font-bold" style={{ color: themeVars.headerText }}>
+                  Image Comparison Platform
+                </h1>
+                <p style={{ color: themeVars.subText }}>
+                  Only SlimOverview + Zoomer* (grouped by Camera+Side, ignoring serial). UV360 ignored.
+                </p>
               </div>
 
-              {error && (
-                <div
-                  className="rounded-lg p-3 text-sm"
-                  style={{
-                    border: "1px solid rgba(239,68,68,0.5)",
-                    background: "rgba(239,68,68,0.08)",
-                    color: "#ef4444",
-                  }}
-                >
-                  {error}
-                </div>
-              )}
+              <button
+                onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                className="px-3 py-2 rounded-lg flex items-center gap-2"
+                style={panelStyle}
+                title="Toggle theme"
+              >
+                {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                <span style={{ color: themeVars.text }}>{theme === "dark" ? "Light" : "Dark"}</span>
+              </button>
+            </div>
 
-              <label className="block">
-                <div
-                  className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors"
-                  style={{
-                    borderColor: theme === "dark" ? "rgba(148,163,184,0.35)" : "rgba(15,23,42,0.20)",
-                    color: themeVars.text,
-                  }}
-                >
-                  <Upload className="w-12 h-12 mx-auto mb-3" style={{ color: themeVars.subText }} />
-                  <p>Click to upload CSV</p>
+            <div className="rounded-xl p-8" style={panelStyle}>
+              <div className="flex items-center gap-4 mb-6">
+                <FileText className="w-10 h-10" style={{ color: theme === "dark" ? "#60a5fa" : "#2563eb" }} />
+                <div>
+                  <h3 className="text-xl font-semibold" style={{ color: themeVars.text }}>
+                    Upload CSV File (Admin Only)
+                  </h3>
                   <p className="text-sm mt-1" style={{ color: themeVars.subText }}>
-                    or drag and drop
+                    Each row should contain an inspection ID. Data will be shared with all users.
                   </p>
                 </div>
-                <input type="file" accept=".csv" onChange={handleCSVUpload} className="hidden" disabled={loading} />
-              </label>
+              </div>
 
-              {loading && (
-                <div className="flex items-center justify-center gap-2" style={{ color: theme === "dark" ? "#60a5fa" : "#2563eb" }}>
-                  <RefreshCw className="w-5 h-5 animate-spin" />
-                  <span>Processing inspections...</span>
+              <div className="space-y-4">
+                <div
+                  className="text-xs font-mono p-3 rounded"
+                  style={{
+                    background: theme === "dark" ? "rgba(15,23,42,0.5)" : "rgba(15,23,42,0.04)",
+                    color: themeVars.subText,
+                  }}
+                >
+                  <strong>API Endpoint:</strong>
+                  <br />
+                  {API_CONFIG.url}
                 </div>
-              )}
+
+                {error && (
+                  <div
+                    className="rounded-lg p-3 text-sm"
+                    style={{
+                      border: "1px solid rgba(239,68,68,0.5)",
+                      background: "rgba(239,68,68,0.08)",
+                      color: "#ef4444",
+                    }}
+                  >
+                    {error}
+                  </div>
+                )}
+
+                <label className="block">
+                  <div
+                    className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors"
+                    style={{
+                      borderColor: theme === "dark" ? "rgba(148,163,184,0.35)" : "rgba(15,23,42,0.20)",
+                      color: themeVars.text,
+                    }}
+                  >
+                    <Upload className="w-12 h-12 mx-auto mb-3" style={{ color: themeVars.subText }} />
+                    <p>Click to upload CSV</p>
+                    <p className="text-sm mt-1" style={{ color: themeVars.subText }}>
+                      or drag and drop
+                    </p>
+                  </div>
+                  <input type="file" accept=".csv" onChange={handleCSVUpload} className="hidden" disabled={loading} />
+                </label>
+
+                {loading && (
+                  <div className="flex items-center justify-center gap-2" style={{ color: theme === "dark" ? "#60a5fa" : "#2563eb" }}>
+                    <RefreshCw className="w-5 h-5 animate-spin" />
+                    <span>Processing inspections...</span>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
+        </div>
+      );
+    }
+
+    // Loading state (while checking auth)
+    return (
+      <div className="min-h-screen p-8 flex items-center justify-center" style={pageStyle}>
+        <style>{comparisonCss}</style>
+        <div className="max-w-md w-full text-center">
+          <RefreshCw className="w-12 h-12 animate-spin mx-auto mb-4" style={{ color: themeVars.text }} />
+          <p style={{ color: themeVars.text }}>Loading...</p>
         </div>
       </div>
     );

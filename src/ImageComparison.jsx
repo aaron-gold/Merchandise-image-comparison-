@@ -2120,6 +2120,9 @@ export default function ImageComparison() {
   // Authentication functions
   const signInWithGoogle = async () => {
     const provider = new GoogleAuthProvider();
+    // Explicitly request email scope to ensure it's in the token
+    provider.addScope('email');
+    provider.addScope('profile');
     try {
       await signInWithPopup(auth, provider);
     } catch (error) {
@@ -2635,6 +2638,10 @@ export default function ImageComparison() {
 
       // ✅ Save to Firebase for other users
       try {
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/79594c6a-1413-4a2d-9298-45631c89aa73',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ImageComparison.jsx:2646',message:'Admin attempting Firebase save',data:{userId:user.uid,userEmail:user.email,isAdmin:isAdmin(user),providerId:user.providerData?.[0]?.providerId},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+        
         const firebaseData = {
           inspections: processedInspections,
           metrics: { ...aggregated, validation },
@@ -2646,7 +2653,10 @@ export default function ImageComparison() {
         console.log("💾 Saving to Firebase:", {
           version: currentVersion,
           inspectionsCount: processedInspections.length,
-          documentPath: `campaigns/${currentVersion}`
+          documentPath: `campaigns/${currentVersion}`,
+          userEmail: user.email,
+          userId: user.uid,
+          isAdmin: isAdmin(user)
         });
         
         await setDoc(
@@ -2659,7 +2669,17 @@ export default function ImageComparison() {
           version: currentVersion
         });
       } catch (firebaseError) {
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/79594c6a-1413-4a2d-9298-45631c89aa73',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ImageComparison.jsx:2661',message:'Firebase save failed',data:{errorCode:firebaseError.code,errorMessage:firebaseError.message,userEmail:user.email,userId:user.uid},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
+        
         console.error("❌ Failed to save to Firebase:", firebaseError);
+        console.error("Error details:", {
+          code: firebaseError.code,
+          message: firebaseError.message,
+          userEmail: user.email,
+          userId: user.uid
+        });
         alert(`Warning: Data was processed but failed to save to Firebase. External users won't see this data. Error: ${firebaseError.message}`);
         // Don't block the admin, just log the error
       }

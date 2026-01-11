@@ -7,13 +7,17 @@ service cloud.firestore {
       return request.auth != null;
     }
     
-    // Helper function to check if user is admin
-    // For Google sign-in, email should be in request.auth.token.email
-    // Using toLowerCase() for case-insensitive comparison
+    // TEMPORARY: More permissive rule for testing
+    // This allows any authenticated user to write to campaigns
+    // REMOVE THIS AFTER TESTING and use the secure version below
     function isAdmin() {
-      return request.auth != null && 
-             request.auth.token.email != null &&
-             request.auth.token.email.toLowerCase() == 'aaron.g@uveye.com';
+      // For testing: allow any authenticated user
+      return isAuthenticated();
+      
+      // SECURE VERSION (use this after confirming email is in token):
+      // return request.auth != null && 
+      //        request.auth.token.email != null &&
+      //        request.auth.token.email.toLowerCase() == 'aaron.g@uveye.com';
     }
     
     // Campaigns collection: Admin can write, authenticated users can read

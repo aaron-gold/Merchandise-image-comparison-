@@ -46,7 +46,21 @@ const ADMIN_EMAIL = "aaron.g@uveye.com";
 // Check if current user is admin
 const isAdmin = (user) => {
   if (!user) return false;
-  return user.email === ADMIN_EMAIL || user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+  if (!user.email) {
+    console.warn("⚠️ User object has no email property:", user);
+    return false;
+  }
+  const userEmail = user.email.toLowerCase().trim();
+  const adminEmail = ADMIN_EMAIL.toLowerCase().trim();
+  const isAdminUser = userEmail === adminEmail;
+  
+  if (!isAdminUser) {
+    console.log("❌ Not admin:", { userEmail, adminEmail, match: false });
+  } else {
+    console.log("✅ Admin detected:", { userEmail, adminEmail });
+  }
+  
+  return isAdminUser;
 };
 
 const API_CONFIG = {
@@ -2842,6 +2856,16 @@ export default function ImageComparison() {
   // Upload screen (Admin only) or Auth screen (Regular users)
   // -------------------------
   if (!loadMethod) {
+    // Debug: Log user info for admin check
+    if (user) {
+      console.log("🔍 User check:", {
+        email: user.email,
+        adminEmail: ADMIN_EMAIL,
+        isAdmin: isAdmin(user),
+        userObject: user
+      });
+    }
+    
     // If not authenticated, show auth screen
     if (!user && !isAuthenticating) {
       return (

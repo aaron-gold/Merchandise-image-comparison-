@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is admin
+    function isAdmin() {
+      return request.auth != null && 
+             request.auth.token.email != null &&
+             request.auth.token.email.toLowerCase() == 'aaron.g@uveye.com';
+    }
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Campaigns collection: Admin can write, authenticated users can read
+    match /campaigns/{version} {
+      // Allow authenticated users to read campaign data
+      allow read: if isAuthenticated();
+      
+      // Only admin can write/update campaign data
+      allow write: if isAdmin();
+    }
+    
+    // Votes collection: Authenticated users can read and write their own votes
+    match /votes/{voteId} {
+      // Anyone authenticated can read votes (for aggregation)
+      allow read: if isAuthenticated();
+      
+      // Users can create votes (they can only create votes with their own userId)
+      allow create: if isAuthenticated() && 
+                       request.resource.data.userId == request.auth.uid;
+      
+      // Users can update/delete only their own votes
+      allow update, delete: if isAuthenticated() && 
+                               resource.data.userId == request.auth.uid;
+    }
+  }
+}

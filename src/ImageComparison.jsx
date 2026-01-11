@@ -2068,29 +2068,49 @@ export default function ImageComparison() {
     // Use real-time listener so users see data immediately when admin uploads
     const docRef = doc(db, "campaigns", currentVersion);
     
+    console.log("🔍 Setting up Firebase listener for external user:", { userId: user.uid, version: currentVersion });
+    
     const unsubscribe = onSnapshot(
       docRef,
       (docSnap) => {
+        console.log("📥 Firebase snapshot received:", { 
+          exists: docSnap.exists(),
+          hasData: !!docSnap.data(),
+          inspectionsCount: docSnap.data()?.inspections?.length || 0
+        });
+        
         setLoadingFromFirebase(false);
         
         if (docSnap.exists()) {
           const data = docSnap.data();
           if (data.inspections && data.inspections.length > 0) {
+            console.log("✅ Inspections loaded from Firebase:", data.inspections.length);
             setInspections(data.inspections);
             setMetrics(data.metrics || { tableA: [], tableD: [], validation: null });
             setLoadMethod("firebase");
             setInspectionsLoaded(true);
           } else {
+            console.warn("⚠️ Document exists but inspections array is empty or missing:", {
+              hasInspections: !!data.inspections,
+              inspectionsLength: data.inspections?.length,
+              dataKeys: Object.keys(data || {})
+            });
             setInspectionsLoaded(false);
           }
         } else {
+          console.log("📭 Document does not exist yet in Firebase");
           setInspectionsLoaded(false);
         }
       },
       (error) => {
-        console.error("Failed to load inspections from Firebase:", error);
+        console.error("❌ Failed to load inspections from Firebase:", error);
         setLoadingFromFirebase(false);
         setInspectionsLoaded(false);
+        
+        // Show user-friendly error for permission issues
+        if (error.code === 'permission-denied') {
+          setError("Permission denied: Please check Firestore security rules. External users need read access to the 'campaigns' collection.");
+        }
       }
     );
     
@@ -2615,20 +2635,32 @@ export default function ImageComparison() {
 
       // ✅ Save to Firebase for other users
       try {
+        const firebaseData = {
+          inspections: processedInspections,
+          metrics: { ...aggregated, validation },
+          uploadedBy: user.email,
+          uploadedAt: serverTimestamp(),
+          version: currentVersion,
+        };
+        
+        console.log("💾 Saving to Firebase:", {
+          version: currentVersion,
+          inspectionsCount: processedInspections.length,
+          documentPath: `campaigns/${currentVersion}`
+        });
+        
         await setDoc(
           doc(db, "campaigns", currentVersion),
-          {
-            inspections: processedInspections,
-            metrics: { ...aggregated, validation },
-            uploadedBy: user.email,
-            uploadedAt: serverTimestamp(),
-            version: currentVersion,
-          },
+          firebaseData,
           { merge: true }
         );
-        console.log("✅ Inspections saved to Firebase for other users");
+        console.log("✅ Inspections saved to Firebase for other users:", {
+          inspectionsCount: processedInspections.length,
+          version: currentVersion
+        });
       } catch (firebaseError) {
-        console.error("Failed to save to Firebase:", firebaseError);
+        console.error("❌ Failed to save to Firebase:", firebaseError);
+        alert(`Warning: Data was processed but failed to save to Firebase. External users won't see this data. Error: ${firebaseError.message}`);
         // Don't block the admin, just log the error
       }
     } catch (err) {
@@ -2929,9 +2961,33 @@ export default function ImageComparison() {
                 <h2 className="text-2xl font-bold mb-4" style={{ color: themeVars.headerText }}>
                   Waiting for Admin
                 </h2>
-                <p style={{ color: themeVars.subText }}>
+                <p style={{ color: themeVars.subText }} className="mb-4">
                   The admin needs to upload inspection data first. Please check back later.
                 </p>
+                {error && error.includes("Permission denied") && (
+                  <div className="mb-4 p-3 rounded-lg" style={{ 
+                    background: theme === "dark" ? "rgba(239,68,68,0.2)" : "rgba(239,68,68,0.1)",
+                    border: `1px solid ${theme === "dark" ? "rgba(239,68,68,0.5)" : "rgba(239,68,68,0.3)"}`
+                  }}>
+                    <p className="text-sm" style={{ color: theme === "dark" ? "#fca5a5" : "#dc2626" }}>
+                      ⚠️ Permission Error: Firestore security rules need to be updated. Please contact the admin.
+                    </p>
+                  </div>
+                )}
+                <p className="text-xs mb-4" style={{ color: themeVars.subText }}>
+                  This page will automatically update when data is available. You can also refresh the page.
+                </p>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm font-medium transition-colors"
+                  style={{
+                    background: theme === "dark" ? "rgba(148,163,184,0.2)" : "rgba(15,23,42,0.1)",
+                    color: themeVars.text,
+                  }}
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Refresh Page
+                </button>
               </div>
             </div>
           </div>
